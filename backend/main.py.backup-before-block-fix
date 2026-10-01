@@ -1,0 +1,3528 @@
+﻿from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, Float, ForeignKey, JSON, func, and_, or_
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Depends,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel
+from passlib.context import CryptContext
+from jose import jwt
+from datetime import datetime, timedelta, timezone
+
+from database import SessionLocal, engine, Base
+from models import (
+    User,
+    Profile,
+    Like,
+    Match,
+    Message,
+    Notification,
+    Connection,
+    Location,
+    
+    LocationShare,
+    EmergencyContact,
+BlockedUser,
+UserReport,
+UserSettings,
+AdminUser,
+UserSuspension,
+)
+
+# =========================================================
+# DATABASE TABLE CREATION
+# =========================================================
+
+Base.metadata.create_all(bind=engine)
+
+
+# =========================================================
+# APP
+# =========================================================
+
+app = FastAPI(
+    title="DearLove API",
+    version="1.0.0",
+)
+
+
+# =========================================================
+# CORS
+# =========================================================
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# =========================================================
+# SECURITY
+# =========================================================
+
+pwd_context = CryptContext(
+    schemes=["bcrypt"],
+    deprecated="auto",
+)
+
+SECRET_KEY = "dearlove-development-secret-change-this-later"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+oauth2_scheme = OAuth2PasswordBearer(
+    tokenUrl="/token"
+)
+
+
+def create_access_token(user_id: int):
+    expire = datetime.now(timezone.utc) + timedelta(
+        minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+    )
+
+    payload = {
+        "sub": str(user_id),
+        "exp": expire,
+    }
+
+    return jwt.encode(
+        payload,
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+
+def get_current_user(
+    token: str = Depends(oauth2_scheme),
+):
+    try:
+        payload = jwt.decode(
+            token,
+            SECRET_KEY,
+            algorithms=[ALGORITHM],
+        )
+
+        user_id = payload.get("sub")
+
+        if user_id is None:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid authentication credentials",
+            )
+
+        return int(user_id)
+
+    except HTTPException:
+        raise
+
+    except Exception:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired token",
+        )
+
+
+# =========================================================
+# REQUEST MODELS
+# =========================================================
+
+class RegisterRequest(BaseModel):
+    username: str
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class ProfileRequest(BaseModel):
+    full_name: str
+    bio: str | None = None
+    gender: str | None = None
+    date_of_birth: str | None = None
+    profile_photo: str | None = None
+
+
+class ProfileUpdate(BaseModel):
+    full_name: str | None = None
+    bio: str | None = None
+    gender: str | None = None
+    date_of_birth: str | None = None
+    profile_photo: str | None = None
+
+
+class MessageUpdateRequest(BaseModel):
+    content: str
+
+
+class LocationUpdateRequest(BaseModel):
+    latitude: float
+    longitude: float
+
+
+class EmergencyContactRequest(BaseModel):
+    contact_name: str
+    contact_phone: str
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def user_exists(db, user_id: int):
+    return db.query(User).filter(
+        User.id == user_id
+    ).first()
+
+
+def create_notification(
+    db,
+    user_id: int,
+    notification_type: str,
+    title: str,
+    message: str,
+):
+    notification = Notification(
+        user_id=user_id,
+        type=notification_type,
+        title=title,
+        message=message,
+        is_read=False,
+    )
+
+    db.add(notification)
+    db.commit()
+    db.refresh(notification)
+
+    return notification
+
+
+# =========================================================
+# BASIC
+# =========================================================
+
+@app.get("/")
+def home():
+    return {
+        "message": "Welcome to DearLove!",
+        "status": "API is working",
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy",
+    }
+
+
+# =========================================================
+# REGISTER
+# =========================================================
+
+@app.post("/register")
+def register_user(data: RegisterRequest):
+    db = SessionLocal()
+
+    try:
+        existing_user = db.query(User).filter(
+            (User.username == data.username)
+            | (User.email == data.email)
+        ).first()
+
+        if existing_user:
+            raise HTTPException(
+                status_code=400,
+                detail="Username or email already registered",
+            )
+
+        hashed_password = pwd_context.hash(data.password)
+
+        new_user = User(
+            username=data.username,
+            email=data.email,
+            password=hashed_password,
+        )
+
+        db.add(new_user)
+        db.commit()
+        db.refresh(new_user)
+
+        return {
+            "message": "User registered successfully",
+            "user_id": new_user.id,
+            "username": new_user.username,
+            "email": new_user.email,
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# LOGIN
+# =========================================================
+
+@app.post("/login")
+def login_user(data: LoginRequest):
+    db = SessionLocal()
+
+    try:
+        user = db.query(User).filter(
+            User.username == data.username
+        ).first()
+
+        if not user:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid username or password",
+            )
+
+        if not pwd_context.verify(
+            data.password,
+            user.password,
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid username or password",
+            )
+
+        access_token = create_access_token(user.id)
+
+        return {
+            "message": "Login successful",
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user_id": user.id,
+            "username": user.username,
+            "email": user.email,
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# OAUTH TOKEN
+# =========================================================
+
+@app.post("/token")
+def token_login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+):
+    db = SessionLocal()
+
+    try:
+        user = db.query(User).filter(
+            User.username == form_data.username
+        ).first()
+
+        if not user:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid username or password",
+            )
+
+        if not pwd_context.verify(
+            form_data.password,
+            user.password,
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid username or password",
+            )
+
+        access_token = create_access_token(user.id)
+
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# CURRENT USER
+# =========================================================
+
+@app.get("/me")
+def get_me(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        user = user_exists(db, user_id)
+
+        if not user:
+            raise HTTPException(
+                status_code=404,
+                detail="User not found",
+            )
+
+        return {
+            "user_id": user.id,
+            "username": user.username,
+            "email": user.email,
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# PROFILE CREATE
+# =========================================================
+
+@app.post("/profile")
+def create_profile(
+    data: ProfileRequest,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        existing = db.query(Profile).filter(
+            Profile.user_id == user_id
+        ).first()
+
+        if existing:
+            raise HTTPException(
+                status_code=400,
+                detail="Profile already exists",
+            )
+
+        profile = Profile(
+            user_id=user_id,
+            full_name=data.full_name,
+            bio=data.bio,
+            gender=data.gender,
+            date_of_birth=data.date_of_birth,
+            profile_photo=data.profile_photo,
+        )
+
+        db.add(profile)
+        db.commit()
+        db.refresh(profile)
+
+        return {
+            "message": "Profile created successfully",
+            "profile_id": profile.id,
+            "user_id": profile.user_id,
+            "full_name": profile.full_name,
+            "bio": profile.bio,
+            "gender": profile.gender,
+            "date_of_birth": profile.date_of_birth,
+            "profile_photo": profile.profile_photo,
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# PROFILE GET
+# =========================================================
+
+@app.get("/profile")
+def get_profile(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        profile = db.query(Profile).filter(
+            Profile.user_id == user_id
+        ).first()
+
+        if not profile:
+            raise HTTPException(
+                status_code=404,
+                detail="Profile not found",
+            )
+
+        return {
+            "profile_id": profile.id,
+            "user_id": profile.user_id,
+            "full_name": profile.full_name,
+            "bio": profile.bio,
+            "gender": profile.gender,
+            "date_of_birth": profile.date_of_birth,
+            "profile_photo": profile.profile_photo,
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# PROFILE UPDATE
+# =========================================================
+
+@app.put("/profile")
+def update_profile(
+    data: ProfileUpdate,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        profile = db.query(Profile).filter(
+            Profile.user_id == user_id
+        ).first()
+
+        if not profile:
+            raise HTTPException(
+                status_code=404,
+                detail="Profile not found",
+            )
+
+        if data.full_name is not None:
+            profile.full_name = data.full_name
+
+        if data.bio is not None:
+            profile.bio = data.bio
+
+        if data.gender is not None:
+            profile.gender = data.gender
+
+        if data.date_of_birth is not None:
+            profile.date_of_birth = data.date_of_birth
+
+        if data.profile_photo is not None:
+            profile.profile_photo = data.profile_photo
+
+        db.commit()
+        db.refresh(profile)
+
+        return {
+            "message": "Profile updated successfully",
+            "profile_id": profile.id,
+            "user_id": profile.user_id,
+            "full_name": profile.full_name,
+            "bio": profile.bio,
+            "gender": profile.gender,
+            "date_of_birth": profile.date_of_birth,
+            "profile_photo": profile.profile_photo,
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# PROFILE DELETE
+# =========================================================
+
+@app.delete("/profile")
+def delete_profile(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        profile = db.query(Profile).filter(
+            Profile.user_id == user_id
+        ).first()
+
+        if not profile:
+            raise HTTPException(
+                status_code=404,
+                detail="Profile not found",
+            )
+
+        db.delete(profile)
+        db.commit()
+
+        return {
+            "message": "Profile deleted successfully",
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# USERS
+# =========================================================
+
+@app.get("/users")
+def get_users(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        users = db.query(User).filter(
+            User.id != user_id
+        ).all()
+
+        return [
+            {
+                "user_id": user.id,
+                "username": user.username,
+                "email": user.email,
+            }
+            for user in users
+        ]
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# USERS WITH PROFILES
+# =========================================================
+
+@app.get("/users/profiles")
+def get_user_profiles(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        users = db.query(User).filter(
+            User.id != user_id
+        ).all()
+
+        results = []
+
+        for user in users:
+            profile = db.query(Profile).filter(
+                Profile.user_id == user.id
+            ).first()
+
+            results.append({
+                "user_id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "profile": {
+                    "profile_id": profile.id if profile else None,
+                    "full_name": profile.full_name if profile else None,
+                    "bio": profile.bio if profile else None,
+                    "gender": profile.gender if profile else None,
+                    "date_of_birth": (
+                        profile.date_of_birth
+                        if profile else None
+                    ),
+                    "profile_photo": (
+                        profile.profile_photo
+                        if profile else None
+                    ),
+                },
+            })
+
+        return results
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# SEARCH USERS
+# =========================================================
+
+@app.get("/users/search")
+def search_users(
+    username: str | None = None,
+    gender: str | None = None,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        users = db.query(User).filter(
+            User.id != user_id
+        ).all()
+
+        results = []
+
+        for user in users:
+            if username and username.lower() not in user.username.lower():
+                continue
+
+            profile = db.query(Profile).filter(
+                Profile.user_id == user.id
+            ).first()
+
+            if gender:
+                if not profile or not profile.gender:
+                    continue
+
+                if profile.gender.lower() != gender.lower():
+                    continue
+
+            results.append({
+                "user_id": user.id,
+                "username": user.username,
+                "profile": {
+                    "profile_id": profile.id if profile else None,
+                    "full_name": profile.full_name if profile else None,
+                    "bio": profile.bio if profile else None,
+                    "gender": profile.gender if profile else None,
+                    "date_of_birth": (
+                        profile.date_of_birth
+                        if profile else None
+                    ),
+                    "profile_photo": (
+                        profile.profile_photo
+                        if profile else None
+                    ),
+                },
+            })
+
+        return results
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# LIKES
+# =========================================================
+
+@app.post("/likes")
+def like_user(
+    liked_user_id: int,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        if liked_user_id == user_id:
+            raise HTTPException(
+                status_code=400,
+                detail="You cannot like yourself",
+            )
+
+        target_user = user_exists(db, liked_user_id)
+
+        if not target_user:
+            raise HTTPException(
+                status_code=404,
+                detail="User not found",
+            )
+
+        existing_like = db.query(Like).filter(
+            Like.user_id == user_id,
+            Like.liked_user_id == liked_user_id,
+        ).first()
+
+        if existing_like:
+            raise HTTPException(
+                status_code=400,
+                detail="You already liked this user",
+            )
+
+        current_user = user_exists(db, user_id)
+
+        new_like = Like(
+            user_id=user_id,
+            liked_user_id=liked_user_id,
+        )
+
+        db.add(new_like)
+        db.commit()
+        db.refresh(new_like)
+
+        create_notification(
+            db,
+            liked_user_id,
+            "like",
+            "New Like â¤ï¸",
+            f"{current_user.username} liked you.",
+        )
+
+        mutual_like = db.query(Like).filter(
+            Like.user_id == liked_user_id,
+            Like.liked_user_id == user_id,
+        ).first()
+
+        if mutual_like:
+            existing_match = db.query(Match).filter(
+                (
+                    (Match.user1_id == user_id)
+                    & (Match.user2_id == liked_user_id)
+                )
+                |
+                (
+                    (Match.user1_id == liked_user_id)
+                    & (Match.user2_id == user_id)
+                )
+            ).first()
+
+            if not existing_match:
+                new_match = Match(
+                    user1_id=user_id,
+                    user2_id=liked_user_id,
+                )
+
+                db.add(new_match)
+                db.commit()
+                db.refresh(new_match)
+
+                create_notification(
+                    db,
+                    user_id,
+                    "match",
+                    "It's a Match! â¤ï¸",
+                    f"You matched with {target_user.username}.",
+                )
+
+                create_notification(
+                    db,
+                    liked_user_id,
+                    "match",
+                    "It's a Match! â¤ï¸",
+                    f"You matched with {current_user.username}.",
+                )
+
+                return {
+                    "message": "It's a match! â¤ï¸",
+                    "like_id": new_like.id,
+                    "match_id": new_match.id,
+                    "user_id": user_id,
+                    "matched_user_id": liked_user_id,
+                }
+
+        return {
+            "message": "User liked successfully",
+            "like_id": new_like.id,
+            "user_id": user_id,
+            "liked_user_id": liked_user_id,
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# RECEIVED LIKES
+# =========================================================
+
+@app.get("/likes/received")
+def get_received_likes(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        likes = db.query(Like).filter(
+            Like.liked_user_id == user_id
+        ).all()
+
+        results = []
+
+        for like in likes:
+            user = user_exists(db, like.user_id)
+
+            if user:
+                results.append({
+                    "like_id": like.id,
+                    "user_id": user.id,
+                    "username": user.username,
+                })
+
+        return results
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# MATCHES
+# =========================================================
+
+@app.get("/matches")
+def get_matches(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        matches = db.query(Match).filter(
+            (Match.user1_id == user_id)
+            | (Match.user2_id == user_id)
+        ).all()
+
+        results = []
+
+        for match in matches:
+            matched_user_id = (
+                match.user2_id
+                if match.user1_id == user_id
+                else match.user1_id
+            )
+
+            user = user_exists(db, matched_user_id)
+
+            if user:
+                results.append({
+                    "match_id": match.id,
+                    "user_id": user.id,
+                    "username": user.username,
+                })
+
+        return results
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# CREATE MATCH
+# =========================================================
+
+@app.post("/matches/create")
+def create_match(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        likes = db.query(Like).filter(
+            Like.user_id == user_id
+        ).all()
+
+        for like in likes:
+            mutual = db.query(Like).filter(
+                Like.user_id == like.liked_user_id,
+                Like.liked_user_id == user_id,
+            ).first()
+
+            if not mutual:
+                continue
+
+            existing = db.query(Match).filter(
+                (
+                    (Match.user1_id == user_id)
+                    & (Match.user2_id == like.liked_user_id)
+                )
+                |
+                (
+                    (Match.user1_id == like.liked_user_id)
+                    & (Match.user2_id == user_id)
+                )
+            ).first()
+
+            if existing:
+                return {
+                    "message": "Match already exists",
+                    "match_id": existing.id,
+                }
+
+            new_match = Match(
+                user1_id=user_id,
+                user2_id=like.liked_user_id,
+            )
+
+            db.add(new_match)
+            db.commit()
+            db.refresh(new_match)
+
+            return {
+                "message": "It's a match! â¤ï¸",
+                "match_id": new_match.id,
+                "user1_id": new_match.user1_id,
+                "user2_id": new_match.user2_id,
+            }
+
+        return {
+            "message": "No mutual like found",
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# DELETE MATCH
+# =========================================================
+
+@app.delete("/matches/{match_id}")
+def delete_match(
+    match_id: int,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        match = db.query(Match).filter(
+            Match.id == match_id
+        ).first()
+
+        if not match:
+            raise HTTPException(
+                status_code=404,
+                detail="Match not found",
+            )
+
+        if user_id not in [match.user1_id, match.user2_id]:
+            raise HTTPException(
+                status_code=403,
+                detail="You are not part of this match",
+            )
+
+        db.delete(match)
+        db.commit()
+
+        return {
+            "message": "Match removed successfully",
+            "match_id": match_id,
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# CONNECTION REQUEST
+# =========================================================
+
+@app.post("/connections/request")
+def send_connection_request(
+    receiver_id: int,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        if receiver_id == user_id:
+            raise HTTPException(
+                status_code=400,
+                detail="You cannot connect with yourself",
+            )
+
+        receiver = user_exists(db, receiver_id)
+
+        if not receiver:
+            raise HTTPException(
+                status_code=404,
+                detail="User not found",
+            )
+
+        existing = db.query(Connection).filter(
+            (
+                (Connection.requester_id == user_id)
+                & (Connection.receiver_id == receiver_id)
+            )
+            |
+            (
+                (Connection.requester_id == receiver_id)
+                & (Connection.receiver_id == user_id)
+            )
+        ).first()
+
+        if existing:
+            if (
+                existing.requester_id == user_id
+                and existing.status == "pending"
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Connection request already sent",
+                )
+
+            if existing.status == "accepted":
+                raise HTTPException(
+                    status_code=400,
+                    detail="You are already connected",
+                )
+
+            if existing.status == "rejected":
+                existing.requester_id = user_id
+                existing.receiver_id = receiver_id
+                existing.status = "pending"
+
+                db.commit()
+                db.refresh(existing)
+
+                return {
+                    "message": "Connection request sent successfully",
+                    "connection_id": existing.id,
+                    "receiver_id": receiver_id,
+                    "status": existing.status,
+                }
+
+            raise HTTPException(
+                status_code=400,
+                detail="Connection request already exists",
+            )
+
+        connection = Connection(
+            requester_id=user_id,
+            receiver_id=receiver_id,
+            status="pending",
+        )
+
+        db.add(connection)
+        db.commit()
+        db.refresh(connection)
+
+        current_user = user_exists(db, user_id)
+
+        create_notification(
+            db,
+            receiver_id,
+            "connection",
+            "New Connection Request ðŸ‘¥",
+            f"{current_user.username} wants to connect with you.",
+        )
+
+        return {
+            "message": "Connection request sent successfully",
+            "connection_id": connection.id,
+            "receiver_id": receiver_id,
+            "status": connection.status,
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# RECEIVED CONNECTIONS
+# =========================================================
+
+@app.get("/connections/received")
+def get_received_connections(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        connections = db.query(Connection).filter(
+            Connection.receiver_id == user_id
+        ).all()
+
+        results = []
+
+        for connection in connections:
+            requester = user_exists(
+                db,
+                connection.requester_id,
+            )
+
+            if requester:
+                results.append({
+                    "connection_id": connection.id,
+                    "user_id": requester.id,
+                    "username": requester.username,
+                    "status": connection.status,
+                })
+
+        return results
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# SENT CONNECTIONS
+# =========================================================
+
+@app.get("/connections/sent")
+def get_sent_connections(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        connections = db.query(Connection).filter(
+            Connection.requester_id == user_id
+        ).all()
+
+        results = []
+
+        for connection in connections:
+            receiver = user_exists(
+                db,
+                connection.receiver_id,
+            )
+
+            if receiver:
+                results.append({
+                    "connection_id": connection.id,
+                    "user_id": receiver.id,
+                    "username": receiver.username,
+                    "status": connection.status,
+                })
+
+        return results
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# ALL CONNECTIONS
+# =========================================================
+
+@app.get("/connections")
+def get_all_connections(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        connections = db.query(Connection).filter(
+            (Connection.requester_id == user_id)
+            | (Connection.receiver_id == user_id)
+        ).all()
+
+        results = []
+
+        for connection in connections:
+            other_id = (
+                connection.receiver_id
+                if connection.requester_id == user_id
+                else connection.requester_id
+            )
+
+            other_user = user_exists(db, other_id)
+
+            if other_user:
+                results.append({
+                    "connection_id": connection.id,
+                    "user_id": other_user.id,
+                    "username": other_user.username,
+                    "status": connection.status,
+                    "direction": (
+                        "sent"
+                        if connection.requester_id == user_id
+                        else "received"
+                    ),
+                })
+
+        return results
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# ACCEPT CONNECTION
+# =========================================================
+
+@app.put("/connections/{connection_id}/accept")
+def accept_connection(
+    connection_id: int,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        connection = db.query(Connection).filter(
+            Connection.id == connection_id
+        ).first()
+
+        if not connection:
+            raise HTTPException(
+                status_code=404,
+                detail="Connection request not found",
+            )
+
+        if connection.receiver_id != user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="You cannot accept this request",
+            )
+
+        if connection.status != "pending":
+            raise HTTPException(
+                status_code=400,
+                detail="Connection request is not pending",
+            )
+
+        connection.status = "accepted"
+
+        current_user = user_exists(db, user_id)
+
+        create_notification(
+            db,
+            connection.requester_id,
+            "connection",
+            "Connection Accepted â¤ï¸",
+            f"{current_user.username} accepted your connection request.",
+        )
+
+        db.commit()
+
+        return {
+            "message": "Connection accepted successfully",
+            "connection_id": connection.id,
+            "status": connection.status,
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# REJECT CONNECTION
+# =========================================================
+
+@app.put("/connections/{connection_id}/reject")
+def reject_connection(
+    connection_id: int,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        connection = db.query(Connection).filter(
+            Connection.id == connection_id
+        ).first()
+
+        if not connection:
+            raise HTTPException(
+                status_code=404,
+                detail="Connection request not found",
+            )
+
+        if connection.receiver_id != user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="You cannot reject this request",
+            )
+
+        if connection.status != "pending":
+            raise HTTPException(
+                status_code=400,
+                detail="Connection request is not pending",
+            )
+
+        connection.status = "rejected"
+        db.commit()
+
+        return {
+            "message": "Connection request rejected",
+            "connection_id": connection.id,
+            "status": connection.status,
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# CANCEL CONNECTION REQUEST
+# =========================================================
+
+@app.delete("/connections/{connection_id}")
+def cancel_connection(
+    connection_id: int,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        connection = db.query(Connection).filter(
+            Connection.id == connection_id
+        ).first()
+
+        if not connection:
+            raise HTTPException(
+                status_code=404,
+                detail="Connection not found",
+            )
+
+        if (
+            connection.requester_id != user_id
+            and connection.receiver_id != user_id
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="You cannot remove this connection",
+            )
+
+        db.delete(connection)
+        db.commit()
+
+        return {
+            "message": "Connection removed successfully",
+            "connection_id": connection_id,
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# SEND MESSAGE
+# =========================================================
+
+@app.post("/messages")
+def send_message(
+    receiver_id: int,
+    content: str,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        receiver = user_exists(db, receiver_id)
+
+        if not receiver:
+            raise HTTPException(
+                status_code=404,
+                detail="Receiver not found",
+            )
+
+        if receiver_id == user_id:
+            raise HTTPException(
+                status_code=400,
+                detail="You cannot message yourself",
+            )
+
+        content = content.strip()
+
+        if not content:
+            raise HTTPException(
+                status_code=400,
+                detail="Message content cannot be empty",
+            )
+
+        message = Message(
+            sender_id=user_id,
+            receiver_id=receiver_id,
+            content=content,
+            is_read=False,
+        )
+
+        db.add(message)
+        db.commit()
+        db.refresh(message)
+
+        return {
+            "message": "Message sent successfully",
+            "message_id": message.id,
+            "sender_id": message.sender_id,
+            "receiver_id": message.receiver_id,
+            "content": message.content,
+            "is_read": message.is_read,
+            "created_at": message.created_at,
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# GET CONVERSATION
+# =========================================================
+
+@app.get("/messages/conversation/{other_user_id}")
+def get_conversation(
+    other_user_id: int,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        other_user = user_exists(db, other_user_id)
+
+        if not other_user:
+            raise HTTPException(
+                status_code=404,
+                detail="User not found",
+            )
+
+        if other_user_id == user_id:
+            raise HTTPException(
+                status_code=400,
+                detail="You cannot have a conversation with yourself",
+            )
+
+        messages = db.query(Message).filter(
+            (
+                (Message.sender_id == user_id)
+                & (Message.receiver_id == other_user_id)
+            )
+            |
+            (
+                (Message.sender_id == other_user_id)
+                & (Message.receiver_id == user_id)
+            )
+        ).order_by(
+            Message.created_at.asc()
+        ).all()
+
+        return [
+            {
+                "message_id": message.id,
+                "sender_id": message.sender_id,
+                "receiver_id": message.receiver_id,
+                "content": message.content,
+                "is_read": message.is_read,
+                "created_at": message.created_at,
+            }
+            for message in messages
+        ]
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# EDIT MESSAGE
+# =========================================================
+
+@app.put("/messages/{message_id}")
+def edit_message(
+    message_id: int,
+    data: MessageUpdateRequest,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        message = db.query(Message).filter(
+            Message.id == message_id
+        ).first()
+
+        if not message:
+            raise HTTPException(
+                status_code=404,
+                detail="Message not found",
+            )
+
+        if message.sender_id != user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="You can only edit your own messages",
+            )
+
+        new_content = data.content.strip()
+
+        if not new_content:
+            raise HTTPException(
+                status_code=400,
+                detail="Message content cannot be empty",
+            )
+
+        message.content = new_content
+
+        db.commit()
+        db.refresh(message)
+
+        return {
+            "message": "Message updated successfully",
+            "message_id": message.id,
+            "sender_id": message.sender_id,
+            "receiver_id": message.receiver_id,
+            "content": message.content,
+            "is_read": message.is_read,
+            "created_at": message.created_at,
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# DELETE MESSAGE
+# =========================================================
+
+@app.delete("/messages/{message_id}")
+def delete_message(
+    message_id: int,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        message = db.query(Message).filter(
+            Message.id == message_id
+        ).first()
+
+        if not message:
+            raise HTTPException(
+                status_code=404,
+                detail="Message not found",
+            )
+
+        if message.sender_id != user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="You can only delete your own messages",
+            )
+
+        db.delete(message)
+        db.commit()
+
+        return {
+            "message": "Message deleted successfully",
+            "message_id": message_id,
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# MARK MESSAGE READ
+# =========================================================
+
+@app.put("/messages/{message_id}/read")
+def mark_message_as_read(
+    message_id: int,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        message = db.query(Message).filter(
+            Message.id == message_id
+        ).first()
+
+        if not message:
+            raise HTTPException(
+                status_code=404,
+                detail="Message not found",
+            )
+
+        if message.receiver_id != user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="You can only mark received messages as read",
+            )
+
+        message.is_read = True
+        db.commit()
+
+        return {
+            "message": "Message marked as read",
+            "message_id": message.id,
+            "is_read": True,
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# MARK CONVERSATION READ
+# =========================================================
+
+@app.put("/messages/conversation/{other_user_id}/read")
+def mark_conversation_as_read(
+    other_user_id: int,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        if not user_exists(db, other_user_id):
+            raise HTTPException(
+                status_code=404,
+                detail="User not found",
+            )
+
+        messages = db.query(Message).filter(
+            Message.sender_id == other_user_id,
+            Message.receiver_id == user_id,
+            Message.is_read == False,
+        ).all()
+
+        for message in messages:
+            message.is_read = True
+
+        db.commit()
+
+        return {
+            "message": "Conversation marked as read",
+            "other_user_id": other_user_id,
+            "messages_marked_as_read": len(messages),
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# UNREAD MESSAGE COUNT
+# =========================================================
+
+@app.get("/messages/unread/count")
+def get_unread_message_count(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        count = db.query(Message).filter(
+            Message.receiver_id == user_id,
+            Message.is_read == False,
+        ).count()
+
+        return {
+            "unread_count": count,
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# UNREAD MESSAGES
+# =========================================================
+
+@app.get("/messages/unread")
+def get_unread_messages(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        messages = db.query(Message).filter(
+            Message.receiver_id == user_id,
+            Message.is_read == False,
+        ).order_by(
+            Message.created_at.asc()
+        ).all()
+
+        return [
+            {
+                "message_id": message.id,
+                "sender_id": message.sender_id,
+                "receiver_id": message.receiver_id,
+                "content": message.content,
+                "is_read": message.is_read,
+                "created_at": message.created_at,
+            }
+            for message in messages
+        ]
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# CONVERSATIONS
+# =========================================================
+
+@app.get("/conversations")
+def get_conversations(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        messages = db.query(Message).filter(
+            (Message.sender_id == user_id)
+            | (Message.receiver_id == user_id)
+        ).order_by(
+            Message.created_at.desc()
+        ).all()
+
+        conversations = {}
+
+        for message in messages:
+            other_user_id = (
+                message.receiver_id
+                if message.sender_id == user_id
+                else message.sender_id
+            )
+
+            if other_user_id in conversations:
+                continue
+
+            other_user = user_exists(db, other_user_id)
+
+            if not other_user:
+                continue
+
+            unread_count = db.query(Message).filter(
+                Message.sender_id == other_user_id,
+                Message.receiver_id == user_id,
+                Message.is_read == False,
+            ).count()
+
+            conversations[other_user_id] = {
+                "user_id": other_user.id,
+                "username": other_user.username,
+                "last_message": message.content,
+                "last_message_id": message.id,
+                "last_message_is_read": message.is_read,
+                "last_message_at": message.created_at,
+                "unread_count": unread_count,
+            }
+
+        return list(conversations.values())
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# SEARCH MESSAGES
+# =========================================================
+
+@app.get("/messages/search")
+def search_messages(
+    keyword: str,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        keyword = keyword.strip()
+
+        if not keyword:
+            raise HTTPException(
+                status_code=400,
+                detail="Search keyword cannot be empty",
+            )
+
+        messages = db.query(Message).filter(
+            (
+                (Message.sender_id == user_id)
+                | (Message.receiver_id == user_id)
+            ),
+            Message.content.ilike(f"%{keyword}%"),
+        ).order_by(
+            Message.created_at.desc()
+        ).all()
+
+        return [
+            {
+                "message_id": message.id,
+                "sender_id": message.sender_id,
+                "receiver_id": message.receiver_id,
+                "content": message.content,
+                "is_read": message.is_read,
+                "created_at": message.created_at,
+            }
+            for message in messages
+        ]
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# LOCATION
+# =========================================================
+
+@app.post("/location")
+def update_location(
+    data: LocationUpdateRequest,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        location = Location(
+            user_id=user_id,
+            latitude=data.latitude,
+            longitude=data.longitude,
+        )
+
+        db.add(location)
+        db.commit()
+        db.refresh(location)
+
+        return {
+            "message": "Location saved successfully",
+            "location_id": location.location_id,
+            "user_id": user_id,
+            "latitude": location.latitude,
+            "longitude": location.longitude,
+            "created_at": location.created_at,
+        }
+
+    finally:
+        db.close()
+
+
+@app.get("/location")
+def get_location(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        location = db.query(Location).filter(
+            Location.user_id == user_id
+        ).order_by(
+            Location.created_at.desc()
+        ).first()
+
+        if not location:
+            return {
+                "message": "No location found",
+                "location": None,
+            }
+
+        return {
+            "message": "Latest location found",
+            "location_id": location.location_id,
+            "user_id": location.user_id,
+            "latitude": location.latitude,
+            "longitude": location.longitude,
+            "created_at": location.created_at,
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# LOCATION SHARING
+# =========================================================
+
+@app.post("/location/share")
+def share_location(
+    viewer_id: int,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        if viewer_id == user_id:
+            raise HTTPException(
+                status_code=400,
+                detail="You cannot share your location with yourself",
+            )
+
+        if not user_exists(db, viewer_id):
+            raise HTTPException(
+                status_code=404,
+                detail="User not found",
+            )
+
+        existing = db.query(LocationShare).filter(
+            LocationShare.owner_id == user_id,
+            LocationShare.viewer_id == viewer_id,
+        ).first()
+
+        if existing:
+            existing.is_active = True
+            db.commit()
+
+            return {
+                "message": "Location sharing enabled successfully",
+                "share_id": existing.share_id,
+                "owner_id": user_id,
+                "viewer_id": viewer_id,
+                "is_active": True,
+            }
+
+        share = LocationShare(
+            owner_id=user_id,
+            viewer_id=viewer_id,
+            is_active=True,
+        )
+
+        db.add(share)
+        db.commit()
+        db.refresh(share)
+
+        create_notification(
+            db,
+            viewer_id,
+            "location",
+            "Location Sharing ðŸ“",
+            "Someone has shared their location with you.",
+        )
+
+        return {
+            "message": "Location shared successfully",
+            "share_id": share.share_id,
+            "owner_id": user_id,
+            "viewer_id": viewer_id,
+            "is_active": True,
+        }
+
+    finally:
+        db.close()
+
+
+@app.get("/location/shared-with-me")
+def get_shared_locations(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        shares = db.query(LocationShare).filter(
+            LocationShare.viewer_id == user_id,
+            LocationShare.is_active == True,
+        ).all()
+
+        results = []
+
+        for share in shares:
+            location = db.query(Location).filter(
+                Location.user_id == share.owner_id
+            ).order_by(
+                Location.created_at.desc()
+            ).first()
+
+            owner = user_exists(db, share.owner_id)
+
+            if location and owner:
+                results.append({
+                    "share_id": share.share_id,
+                    "user_id": owner.id,
+                    "username": owner.username,
+                    "latitude": location.latitude,
+                    "longitude": location.longitude,
+                    "created_at": location.created_at,
+                })
+
+        return results
+
+    finally:
+        db.close()
+
+
+@app.get("/location/shares")
+def get_my_location_shares(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        shares = db.query(LocationShare).filter(
+            LocationShare.owner_id == user_id
+        ).all()
+
+        results = []
+
+        for share in shares:
+            viewer = user_exists(db, share.viewer_id)
+
+            if viewer:
+                results.append({
+                    "share_id": share.share_id,
+                    "viewer_id": viewer.id,
+                    "username": viewer.username,
+                    "is_active": share.is_active,
+                })
+
+        return results
+
+    finally:
+        db.close()
+
+
+@app.put("/location/share/{share_id}/stop")
+def stop_location_sharing(
+    share_id: int,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        share = db.query(LocationShare).filter(
+            LocationShare.share_id == share_id
+        ).first()
+
+        if not share:
+            raise HTTPException(
+                status_code=404,
+                detail="Location share not found",
+            )
+
+        if share.owner_id != user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="You cannot stop this location share",
+            )
+
+        share.is_active = False
+        db.commit()
+
+        return {
+            "message": "Location sharing stopped successfully",
+            "share_id": share_id,
+            "is_active": False,
+        }
+
+    finally:
+        db.close()
+
+
+@app.delete("/location/share/{share_id}")
+def delete_location_share(
+    share_id: int,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        share = db.query(LocationShare).filter(
+            LocationShare.share_id == share_id
+        ).first()
+
+        if not share:
+            raise HTTPException(
+                status_code=404,
+                detail="Location share not found",
+            )
+
+        if share.owner_id != user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="You cannot delete this location share",
+            )
+
+        db.delete(share)
+        db.commit()
+
+        return {
+            "message": "Location share removed successfully",
+            "share_id": share_id,
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# EMERGENCY CONTACTS
+# =========================================================
+
+@app.post("/emergency-contacts")
+def add_emergency_contact(
+    data: EmergencyContactRequest,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        contact = EmergencyContact(
+            user_id=user_id,
+            contact_name=data.contact_name.strip(),
+            contact_phone=data.contact_phone.strip(),
+        )
+
+        if not contact.contact_name:
+            raise HTTPException(
+                status_code=400,
+                detail="Contact name is required",
+            )
+
+        if not contact.contact_phone:
+            raise HTTPException(
+                status_code=400,
+                detail="Contact phone is required",
+            )
+
+        db.add(contact)
+        db.commit()
+        db.refresh(contact)
+
+        return {
+            "success": True,
+            "message": "Emergency contact added successfully â¤ï¸",
+            "contact": {
+                "id": contact.id,
+                "contact_name": contact.contact_name,
+                "contact_phone": contact.contact_phone,
+            },
+        }
+
+    finally:
+        db.close()
+
+
+@app.get("/emergency-contacts")
+def get_emergency_contacts(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        contacts = db.query(EmergencyContact).filter(
+            EmergencyContact.user_id == user_id
+        ).all()
+
+        return [
+            {
+                "id": contact.id,
+                "contact_name": contact.contact_name,
+                "contact_phone": contact.contact_phone,
+            }
+            for contact in contacts
+        ]
+
+    finally:
+        db.close()
+
+
+@app.delete("/emergency-contacts/{contact_id}")
+def delete_emergency_contact(
+    contact_id: int,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        contact = db.query(EmergencyContact).filter(
+            EmergencyContact.id == contact_id
+        ).first()
+
+        if not contact:
+            raise HTTPException(
+                status_code=404,
+                detail="Emergency contact not found",
+            )
+
+        if contact.user_id != user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="You cannot delete this contact",
+            )
+
+        db.delete(contact)
+        db.commit()
+
+        return {
+            "success": True,
+            "message": "Emergency contact deleted successfully",
+            "contact_id": contact_id,
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# SOS
+# =========================================================
+
+@app.post("/sos")
+def create_sos(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        contacts = db.query(EmergencyContact).filter(
+            EmergencyContact.user_id == user_id
+        ).all()
+
+        location = db.query(Location).filter(
+            Location.user_id == user_id
+        ).order_by(
+            Location.created_at.desc()
+        ).first()
+
+        current_user = user_exists(db, user_id)
+
+        contact_list = [
+            {
+                "id": contact.id,
+                "name": contact.contact_name,
+                "phone": contact.contact_phone,
+            }
+            for contact in contacts
+        ]
+
+        # Create an in-app SOS notification for the user.
+        create_notification(
+            db,
+            user_id,
+            "sos",
+            "SOS Activated ðŸš¨",
+            "Your SOS alert has been activated.",
+        )
+
+        return {
+            "success": True,
+            "message": "SOS alert activated ðŸš¨",
+            "user_id": user_id,
+            "username": current_user.username if current_user else None,
+            "emergency_contacts": contact_list,
+            "contacts_count": len(contact_list),
+            "location": (
+                {
+                    "latitude": location.latitude,
+                    "longitude": location.longitude,
+                    "created_at": location.created_at,
+                }
+                if location
+                else None
+            ),
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# NOTIFICATIONS
+# =========================================================
+
+@app.get("/notifications")
+def get_notifications(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        notifications = db.query(Notification).filter(
+            Notification.user_id == user_id
+        ).order_by(
+            Notification.created_at.desc()
+        ).all()
+
+        return [
+            {
+                "notification_id": notification.id,
+                "user_id": notification.user_id,
+                "type": notification.type,
+                "title": notification.title,
+                "message": notification.message,
+                "is_read": notification.is_read,
+                "created_at": notification.created_at,
+            }
+            for notification in notifications
+        ]
+
+    finally:
+        db.close()
+
+
+@app.get("/notifications/unread/count")
+def get_unread_notification_count(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        count = db.query(Notification).filter(
+            Notification.user_id == user_id,
+            Notification.is_read == False,
+        ).count()
+
+        return {
+            "unread_count": count,
+        }
+
+    finally:
+        db.close()
+
+
+@app.put("/notifications/{notification_id}/read")
+def mark_notification_as_read(
+    notification_id: int,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        notification = db.query(Notification).filter(
+            Notification.id == notification_id
+        ).first()
+
+        if not notification:
+            raise HTTPException(
+                status_code=404,
+                detail="Notification not found",
+            )
+
+        if notification.user_id != user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="You cannot access this notification",
+            )
+
+        notification.is_read = True
+        db.commit()
+
+        return {
+            "message": "Notification marked as read",
+            "notification_id": notification.id,
+            "is_read": True,
+        }
+
+    finally:
+        db.close()
+
+
+@app.put("/notifications/read-all")
+def mark_all_notifications_as_read(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        notifications = db.query(Notification).filter(
+            Notification.user_id == user_id,
+            Notification.is_read == False,
+        ).all()
+
+        for notification in notifications:
+            notification.is_read = True
+
+        db.commit()
+
+        return {
+            "message": "All notifications marked as read",
+            "notifications_marked_as_read": len(notifications),
+        }
+
+    finally:
+        db.close()
+
+
+@app.delete("/notifications/{notification_id}")
+def delete_notification(
+    notification_id: int,
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        notification = db.query(Notification).filter(
+            Notification.id == notification_id
+        ).first()
+
+        if not notification:
+            raise HTTPException(
+                status_code=404,
+                detail="Notification not found",
+            )
+
+        if notification.user_id != user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="You cannot delete this notification",
+            )
+
+        db.delete(notification)
+        db.commit()
+
+        return {
+            "message": "Notification deleted successfully",
+            "notification_id": notification_id,
+        }
+
+    finally:
+        db.close()
+
+
+@app.delete("/notifications")
+def delete_all_notifications(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        notifications = db.query(Notification).filter(
+            Notification.user_id == user_id
+        ).all()
+
+        count = len(notifications)
+
+        for notification in notifications:
+            db.delete(notification)
+
+        db.commit()
+
+        return {
+            "message": "All notifications deleted successfully",
+            "notifications_deleted": count,
+        }
+
+    finally:
+        db.close()
+
+
+@app.post("/notifications/test")
+def create_test_notification(
+    user_id: int = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        notification = Notification(
+            user_id=user_id,
+            type="system",
+            title="Welcome to DearLove â¤ï¸",
+            message="Your DearLove notification system is working!",
+            is_read=False,
+        )
+
+        db.add(notification)
+        db.commit()
+        db.refresh(notification)
+
+        return {
+            "message": "Test notification created successfully",
+            "notification_id": notification.id,
+        }
+
+    finally:
+        db.close()
+
+
+# =========================================================
+# REAL-TIME CHAT
+# =========================================================
+
+active_connections = {}
+
+
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(
+    websocket: WebSocket,
+    user_id: int,
+):
+    await websocket.accept()
+
+    active_connections[user_id] = websocket
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+
+            receiver_id = data.get("receiver_id")
+            content = data.get("content")
+
+            if not receiver_id or not content:
+                continue
+
+            try:
+                receiver_id = int(receiver_id)
+            except Exception:
+                continue
+
+            content = str(content).strip()
+
+            if not content:
+                continue
+
+            db = SessionLocal()
+
+            try:
+                receiver = user_exists(db, receiver_id)
+
+                if not receiver:
+                    continue
+
+                message = Message(
+                    sender_id=user_id,
+                    receiver_id=receiver_id,
+                    content=content,
+                    is_read=False,
+                )
+
+                db.add(message)
+                db.commit()
+                db.refresh(message)
+
+                message_data = {
+                    "message_id": message.id,
+                    "sender_id": message.sender_id,
+                    "receiver_id": message.receiver_id,
+                    "content": message.content,
+                    "is_read": message.is_read,
+                    "created_at": (
+                        message.created_at.isoformat()
+                        if message.created_at
+                        else None
+                    ),
+                }
+
+            finally:
+                db.close()
+
+            receiver_socket = active_connections.get(receiver_id)
+
+            if receiver_socket:
+                try:
+                    await receiver_socket.send_json(
+                        message_data
+                    )
+                except Exception:
+                    if active_connections.get(receiver_id) == receiver_socket:
+                        del active_connections[receiver_id]
+
+            await websocket.send_json(message_data)
+
+    except WebSocketDisconnect:
+        if active_connections.get(user_id) == websocket:
+            del active_connections[user_id]
+
+    except Exception:
+        if active_connections.get(user_id) == websocket:
+            del active_connections[user_id]
+
+
+# =========================================================
+# WEBRTC CALL SIGNALING
+# =========================================================
+
+call_connections = {}
+
+
+@app.websocket("/ws/call/{user_id}")
+async def call_websocket(
+    websocket: WebSocket,
+    user_id: int,
+):
+    await websocket.accept()
+
+    call_connections[user_id] = websocket
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+
+            receiver_id = data.get("receiver_id")
+
+            if not receiver_id:
+                continue
+
+            try:
+                receiver_id = int(receiver_id)
+            except Exception:
+                continue
+
+            receiver_socket = call_connections.get(receiver_id)
+
+            if receiver_socket:
+                try:
+                    await receiver_socket.send_json(data)
+                except Exception:
+                    if call_connections.get(receiver_id) == receiver_socket:
+                        del call_connections[receiver_id]
+
+    except WebSocketDisconnect:
+        if call_connections.get(user_id) == websocket:
+            del call_connections[user_id]
+
+    except Exception:
+        if call_connections.get(user_id) == websocket:
+            del call_connections[user_id]
+
+
+
+# =========================================================
+# BLOCKED USERS
+# =========================================================
+
+class BlockedUser(Base):
+    __tablename__ = "blocked_users"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    blocker_id = Column(
+        Integer,
+        ForeignKey("users.id"),
+        nullable=False,
+        index=True
+    )
+
+    blocked_id = Column(
+        Integer,
+        ForeignKey("users.id"),
+        nullable=False,
+        index=True
+    )
+
+    created_at = Column(
+        DateTime,
+        default=datetime.utcnow
+    )
+
+
+# =========================================================
+# USER REPORTS
+# =========================================================
+
+class UserReport(Base):
+    __tablename__ = "user_reports"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    reporter_id = Column(
+        Integer,
+        ForeignKey("users.id"),
+        nullable=False,
+        index=True
+    )
+
+    reported_id = Column(
+        Integer,
+        ForeignKey("users.id"),
+        nullable=False,
+        index=True
+    )
+
+    reason = Column(
+        String(100),
+        nullable=False
+    )
+
+    description = Column(
+        String(1000),
+        nullable=True
+    )
+
+    status = Column(
+        String(30),
+        default="pending",
+        nullable=False
+    )
+
+    created_at = Column(
+        DateTime,
+        default=datetime.utcnow
+    )
+
+
+# =========================================================
+# USER SETTINGS
+# =========================================================
+
+class UserSettings(Base):
+    __tablename__ = "user_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id"),
+        unique=True,
+        nullable=False,
+        index=True
+    )
+
+    notifications_enabled = Column(
+        Boolean,
+        default=True,
+        nullable=False
+    )
+
+    message_notifications = Column(
+        Boolean,
+        default=True,
+        nullable=False
+    )
+
+    location_sharing_enabled = Column(
+        Boolean,
+        default=True,
+        nullable=False
+    )
+
+    show_online_status = Column(
+        Boolean,
+        default=True,
+        nullable=False
+    )
+
+    profile_discoverable = Column(
+        Boolean,
+        default=True,
+        nullable=False
+    )
+
+    created_at = Column(
+        DateTime,
+        default=datetime.utcnow
+    )
+
+    updated_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow
+    )
+
+
+# =========================================================
+# ADMIN USERS
+# =========================================================
+
+class AdminUser(Base):
+    __tablename__ = "admin_users"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id"),
+        unique=True,
+        nullable=False,
+        index=True
+    )
+
+    is_active = Column(
+        Boolean,
+        default=True,
+        nullable=False
+    )
+
+    created_at = Column(
+        DateTime,
+        default=datetime.utcnow
+    )
+
+
+# =========================================================
+# USER SUSPENSIONS
+# =========================================================
+
+class UserSuspension(Base):
+    __tablename__ = "user_suspensions"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id"),
+        unique=True,
+        nullable=False,
+        index=True
+    )
+
+    reason = Column(
+        String(500),
+        nullable=True
+    )
+
+    is_active = Column(
+        Boolean,
+        default=True,
+        nullable=False
+    )
+
+    created_at = Column(
+        DateTime,
+        default=datetime.utcnow
+    )
+
+    expires_at = Column(
+        DateTime,
+        nullable=True
+    )
+
+# =========================================================
+# DEARLOVE - BLOCK / REPORT / SETTINGS / ADMIN
+# =========================================================
+
+
+# =========================================================
+# BLOCK USER
+# =========================================================
+
+class BlockUserRequest(BaseModel):
+    user_id: int
+
+
+@app.post("/users/block")
+def block_user(
+    data: BlockUserRequest,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    if data.user_id == current_user:
+        raise HTTPException(
+            status_code=400,
+            detail="You cannot block yourself"
+        )
+
+    target = db.query(User).filter(
+        User.id == data.user_id
+    ).first()
+
+    if not target:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+
+    existing = db.query(BlockedUser).filter(
+        BlockedUser.blocker_id == current_user,
+        BlockedUser.blocked_id == data.user_id,
+    ).first()
+
+    if existing:
+        return {
+            "success": True,
+            "message": "User already blocked"
+        }
+
+    blocked = BlockedUser(
+        blocker_id=current_user,
+        blocked_id=data.user_id,
+    )
+
+    db.add(blocked)
+    db.commit()
+
+    return {
+        "success": True,
+        "message": "User blocked successfully"
+    }
+
+
+# =========================================================
+# UNBLOCK USER
+# =========================================================
+
+@app.delete("/users/block/{user_id}")
+def unblock_user(
+    user_id: int,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    blocked = db.query(BlockedUser).filter(
+        BlockedUser.blocker_id == current_user,
+        BlockedUser.blocked_id == user_id,
+    ).first()
+
+    if not blocked:
+        raise HTTPException(
+            status_code=404,
+            detail="User is not blocked"
+        )
+
+    db.delete(blocked)
+    db.commit()
+
+    return {
+        "success": True,
+        "message": "User unblocked successfully"
+    }
+
+
+# =========================================================
+# MY BLOCKED USERS
+# =========================================================
+
+@app.get("/users/blocked")
+def get_blocked_users(
+    db=Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    blocked = db.query(BlockedUser).filter(
+        BlockedUser.blocker_id == current_user
+    ).all()
+
+    result = []
+
+    for item in blocked:
+        user = db.query(User).filter(
+            User.id == item.blocked_id
+        ).first()
+
+        if user:
+            profile = db.query(Profile).filter(
+                Profile.user_id == user.id
+            ).first()
+
+            result.append({
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "full_name": profile.full_name if profile else None,
+                "profile_photo": profile.profile_photo if profile else None,
+                "created_at": item.created_at,
+            })
+
+    return result
+
+
+# =========================================================
+# REPORT USER
+# =========================================================
+
+class ReportUserRequest(BaseModel):
+    user_id: int
+    reason: str
+    description: str | None = None
+
+
+@app.post("/users/report")
+def report_user(
+    data: ReportUserRequest,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    if data.user_id == current_user:
+        raise HTTPException(
+            status_code=400,
+            detail="You cannot report yourself"
+        )
+
+    target = db.query(User).filter(
+        User.id == data.user_id
+    ).first()
+
+    if not target:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+
+    report = UserReport(
+        reporter_id=current_user,
+        reported_id=data.user_id,
+        reason=data.reason,
+        description=data.description,
+        status="pending",
+    )
+
+    db.add(report)
+    db.commit()
+    db.refresh(report)
+
+    return {
+        "success": True,
+        "message": "Report submitted successfully",
+        "report_id": report.id,
+    }
+
+
+# =========================================================
+# USER SETTINGS
+# =========================================================
+
+class SettingsUpdate(BaseModel):
+    notifications_enabled: bool | None = None
+    message_notifications: bool | None = None
+    location_sharing_enabled: bool | None = None
+    show_online_status: bool | None = None
+    profile_discoverable: bool | None = None
+
+
+@app.get("/settings")
+def get_settings(
+    db=Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    settings = db.query(UserSettings).filter(
+        UserSettings.user_id == current_user
+    ).first()
+
+    if not settings:
+        settings = UserSettings(
+            user_id=current_user
+        )
+
+        db.add(settings)
+        db.commit()
+        db.refresh(settings)
+
+    return {
+        "notifications_enabled": settings.notifications_enabled,
+        "message_notifications": settings.message_notifications,
+        "location_sharing_enabled": settings.location_sharing_enabled,
+        "show_online_status": settings.show_online_status,
+        "profile_discoverable": settings.profile_discoverable,
+    }
+
+
+@app.put("/settings")
+def update_settings(
+    data: SettingsUpdate,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    settings = db.query(UserSettings).filter(
+        UserSettings.user_id == current_user
+    ).first()
+
+    if not settings:
+        settings = UserSettings(
+            user_id=current_user
+        )
+        db.add(settings)
+
+    update_data = data.model_dump(
+        exclude_unset=True
+    )
+
+    for key, value in update_data.items():
+        setattr(settings, key, value)
+
+    settings.updated_at = datetime.utcnow()
+
+    db.commit()
+    db.refresh(settings)
+
+    return {
+        "success": True,
+        "message": "Settings updated successfully",
+        "settings": {
+            "notifications_enabled": settings.notifications_enabled,
+            "message_notifications": settings.message_notifications,
+            "location_sharing_enabled": settings.location_sharing_enabled,
+            "show_online_status": settings.show_online_status,
+            "profile_discoverable": settings.profile_discoverable,
+        },
+    }
+
+
+# =========================================================
+# ADMIN HELPER
+# =========================================================
+
+def require_admin(
+    db,
+    user_id: int,
+):
+    admin = db.query(AdminUser).filter(
+        AdminUser.user_id == user_id,
+        AdminUser.is_active == True,
+    ).first()
+
+    if not admin:
+        raise HTTPException(
+            status_code=403,
+            detail="Administrator access required"
+        )
+
+    return admin
+
+
+# =========================================================
+# ADMIN BOOTSTRAP
+# =========================================================
+
+class AdminBootstrapRequest(BaseModel):
+    user_id: int
+    secret: str
+
+
+@app.post("/admin/bootstrap")
+def admin_bootstrap(
+    data: AdminBootstrapRequest,
+    db=Depends(get_db),
+):
+    # Local development bootstrap secret.
+    # Change this before production deployment.
+    ADMIN_BOOTSTRAP_SECRET = "DearLoveAdmin2026"
+
+    if data.secret != ADMIN_BOOTSTRAP_SECRET:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid bootstrap secret"
+        )
+
+    user = db.query(User).filter(
+        User.id == data.user_id
+    ).first()
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+
+    existing = db.query(AdminUser).filter(
+        AdminUser.user_id == data.user_id
+    ).first()
+
+    if existing:
+        existing.is_active = True
+        db.commit()
+
+        return {
+            "success": True,
+            "message": "User is already an administrator"
+        }
+
+    admin = AdminUser(
+        user_id=data.user_id,
+        is_active=True,
+    )
+
+    db.add(admin)
+    db.commit()
+
+    return {
+        "success": True,
+        "message": "Administrator created successfully"
+    }
+
+
+# =========================================================
+# ADMIN STATUS
+# =========================================================
+
+@app.get("/admin/me")
+def admin_me(
+    db=Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    admin = db.query(AdminUser).filter(
+        AdminUser.user_id == current_user,
+        AdminUser.is_active == True,
+    ).first()
+
+    return {
+        "is_admin": admin is not None,
+        "user_id": current_user,
+    }
+
+
+# =========================================================
+# ADMIN STATISTICS
+# =========================================================
+
+@app.get("/admin/stats")
+def admin_stats(
+    db=Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    require_admin(db, current_user)
+
+    return {
+        "users": db.query(User).count(),
+        "profiles": db.query(Profile).count(),
+        "messages": db.query(Message).count(),
+        "matches": db.query(Match).count(),
+        "connections": db.query(Connection).count(),
+        "likes": db.query(Like).count(),
+        "reports": db.query(UserReport).count(),
+        "blocked_users": db.query(BlockedUser).count(),
+        "locations": db.query(Location).count(),
+        "emergency_contacts": db.query(EmergencyContact).count(),
+    }
+
+
+# =========================================================
+# ADMIN - LIST USERS
+# =========================================================
+
+@app.get("/admin/users")
+def admin_users(
+    db=Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    require_admin(db, current_user)
+
+    users = db.query(User).order_by(
+        User.id.desc()
+    ).all()
+
+    result = []
+
+    for user in users:
+        profile = db.query(Profile).filter(
+            Profile.user_id == user.id
+        ).first()
+
+        suspension = db.query(UserSuspension).filter(
+            UserSuspension.user_id == user.id,
+            UserSuspension.is_active == True,
+        ).first()
+
+        admin = db.query(AdminUser).filter(
+            AdminUser.user_id == user.id,
+            AdminUser.is_active == True,
+        ).first()
+
+        result.append({
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "full_name": profile.full_name if profile else None,
+            "profile_photo": profile.profile_photo if profile else None,
+            "created_at": user.created_at,
+            "is_admin": admin is not None,
+            "is_suspended": suspension is not None,
+            "suspension_reason": (
+                suspension.reason
+                if suspension
+                else None
+            ),
+        })
+
+    return result
+
+
+# =========================================================
+# ADMIN - LIST REPORTS
+# =========================================================
+
+@app.get("/admin/reports")
+def admin_reports(
+    db=Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    require_admin(db, current_user)
+
+    reports = db.query(UserReport).order_by(
+        UserReport.id.desc()
+    ).all()
+
+    result = []
+
+    for report in reports:
+        reporter = db.query(User).filter(
+            User.id == report.reporter_id
+        ).first()
+
+        reported = db.query(User).filter(
+            User.id == report.reported_id
+        ).first()
+
+        result.append({
+            "id": report.id,
+            "reporter_id": report.reporter_id,
+            "reporter_username": (
+                reporter.username
+                if reporter
+                else None
+            ),
+            "reported_id": report.reported_id,
+            "reported_username": (
+                reported.username
+                if reported
+                else None
+            ),
+            "reason": report.reason,
+            "description": report.description,
+            "status": report.status,
+            "created_at": report.created_at,
+        })
+
+    return result
+
+
+# =========================================================
+# ADMIN - UPDATE REPORT
+# =========================================================
+
+class ReportStatusUpdate(BaseModel):
+    status: str
+
+
+@app.put("/admin/reports/{report_id}")
+def update_report(
+    report_id: int,
+    data: ReportStatusUpdate,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    require_admin(db, current_user)
+
+    allowed_statuses = {
+        "pending",
+        "reviewing",
+        "resolved",
+        "dismissed",
+    }
+
+    if data.status not in allowed_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid report status"
+        )
+
+    report = db.query(UserReport).filter(
+        UserReport.id == report_id
+    ).first()
+
+    if not report:
+        raise HTTPException(
+            status_code=404,
+            detail="Report not found"
+        )
+
+    report.status = data.status
+
+    db.commit()
+
+    return {
+        "success": True,
+        "message": "Report updated successfully"
+    }
+
+
+# =========================================================
+# ADMIN - SUSPEND USER
+# =========================================================
+
+class SuspendUserRequest(BaseModel):
+    reason: str | None = None
+    expires_at: datetime | None = None
+
+
+@app.post("/admin/users/{user_id}/suspend")
+def suspend_user(
+    user_id: int,
+    data: SuspendUserRequest,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    require_admin(db, current_user)
+
+    if user_id == current_user:
+        raise HTTPException(
+            status_code=400,
+            detail="You cannot suspend yourself"
+        )
+
+    user = db.query(User).filter(
+        User.id == user_id
+    ).first()
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+
+    suspension = db.query(UserSuspension).filter(
+        UserSuspension.user_id == user_id
+    ).first()
+
+    if suspension:
+        suspension.reason = data.reason
+        suspension.expires_at = data.expires_at
+        suspension.is_active = True
+    else:
+        suspension = UserSuspension(
+            user_id=user_id,
+            reason=data.reason,
+            expires_at=data.expires_at,
+            is_active=True,
+        )
+
+        db.add(suspension)
+
+    db.commit()
+
+    return {
+        "success": True,
+        "message": "User suspended successfully"
+    }
+
+
+# =========================================================
+# ADMIN - UNSUSPEND USER
+# =========================================================
+
+@app.post("/admin/users/{user_id}/unsuspend")
+def unsuspend_user(
+    user_id: int,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    require_admin(db, current_user)
+
+    suspension = db.query(UserSuspension).filter(
+        UserSuspension.user_id == user_id
+    ).first()
+
+    if not suspension:
+        raise HTTPException(
+            status_code=404,
+            detail="User is not suspended"
+        )
+
+    suspension.is_active = False
+
+    db.commit()
+
+    return {
+        "success": True,
+        "message": "User unsuspended successfully"
+    }
+
+
+# =========================================================
+# ADMIN - PROMOTE USER
+# =========================================================
+
+@app.post("/admin/users/{user_id}/promote")
+def promote_admin(
+    user_id: int,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    require_admin(db, current_user)
+
+    user = db.query(User).filter(
+        User.id == user_id
+    ).first()
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+
+    existing = db.query(AdminUser).filter(
+        AdminUser.user_id == user_id
+    ).first()
+
+    if existing:
+        existing.is_active = True
+    else:
+        db.add(
+            AdminUser(
+                user_id=user_id,
+                is_active=True,
+            )
+        )
+
+    db.commit()
+
+    return {
+        "success": True,
+        "message": "User promoted to administrator"
+    }
+
+
+# =========================================================
+# ADMIN - REMOVE ADMIN
+# =========================================================
+
+@app.post("/admin/users/{user_id}/demote")
+def demote_admin(
+    user_id: int,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    require_admin(db, current_user)
+
+    if user_id == current_user:
+        raise HTTPException(
+            status_code=400,
+            detail="You cannot remove your own administrator access"
+        )
+
+    admin = db.query(AdminUser).filter(
+        AdminUser.user_id == user_id
+    ).first()
+
+    if not admin:
+        raise HTTPException(
+            status_code=404,
+            detail="User is not an administrator"
+        )
+
+    admin.is_active = False
+
+    db.commit()
+
+    return {
+        "success": True,
+        "message": "Administrator access removed"
+    }
